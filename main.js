@@ -7,15 +7,17 @@ const VIEW_TYPE = 'diary-link-timeline-view';
 const EXPORT_PREFIX = '_timeline-export-';
 const LINK_RE = /(?<!!)\[\[([^\]|#]+)/g;
 const UNLINKED_FILTER = '__unlinked__';
+const LEGACY_DEFAULT_TITLE = '日记链接时间轴';
 
 const DEFAULT_SETTINGS = {
   diaryFolder: '日记',
   exportFolder: '',
   exportNameTemplate: '{{title}}-{{datetime}}',
-  exportTitle: '日记链接时间轴',
-  enableClickActions: true, // 总开关
-  linkClickAction: 'navigate', // 'navigate' | 'filter'
+  exportTitle: '',
+  enableClickActions: true,
+  linkClickAction: 'navigate',
   textClickCopy: true,
+  pinnedFilters: [],
 };
 
 async function writeClipboard(text) {
@@ -53,6 +55,22 @@ class DiaryLinkTimelinePlugin extends Plugin {
       .diary-timeline-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
       .diary-timeline-toolbar select { max-width: 260px; }
       .diary-timeline-status { color: var(--text-muted); font-size: 0.85em; }
+      .diary-timeline-pin-filter-btn { font-size: 16px; line-height: 1; padding: 2px 6px; }
+      .diary-timeline-pin-filter-btn.is-pinned { color: var(--text-accent); }
+      .diary-timeline-pin-filter-btn:disabled { opacity: 0.4; cursor: default; }
+
+      .diary-timeline-pinned-filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; padding: 8px 10px; background: var(--background-secondary-alt); border: 1px solid var(--background-modifier-border); border-radius: 6px; }
+      .diary-timeline-pinned-filters.is-empty { display: none; }
+      .diary-timeline-pinned-label { color: var(--text-muted); font-size: 0.8em; margin-right: 4px; align-self: center; }
+      .diary-timeline-chip { display: inline-flex; align-items: center; padding: 2px 10px; background: var(--background-secondary); border: 1px solid var(--background-modifier-border); border-radius: 12px; font-size: 0.85em; transition: background 0.15s, border-color 0.15s, transform 0.1s; }
+      .diary-timeline-chip:hover { background: var(--background-modifier-hover); }
+      .diary-timeline-chip:active { transform: scale(0.97); }
+      .diary-timeline-chip.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
+      .diary-timeline-chip.is-active:hover { background: var(--interactive-accent-hover); }
+      .diary-timeline-chip.is-invalid { opacity: 0.55; }
+      .diary-timeline-chip.is-invalid .diary-timeline-chip-label { text-decoration: line-through; }
+      .diary-timeline-chip-label { cursor: pointer; user-select: none; }
+
       .diary-timeline-content h1 { margin-top: 32px; border-bottom: 2px solid var(--text-accent); padding-bottom: 6px; font-size: 1.5em; }
       .diary-timeline-content h2 { margin-top: 24px; border-bottom: 2px solid var(--background-modifier-border); padding-bottom: 4px; }
       .diary-timeline-content h3 { margin-top: 16px; color: var(--text-accent); }
@@ -64,11 +82,11 @@ class DiaryLinkTimelinePlugin extends Plugin {
       .diary-timeline-text.is-copied { background: var(--text-selection); transition: background 0.3s; }
       .diary-timeline-text p:first-child { margin-top: 0; }
       .diary-timeline-text p:last-child { margin-bottom: 0; }
+
       .diary-timeline-preview { margin: 12px 0; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-family: var(--font-monospace); font-size: 0.9em; word-break: break-all; color: var(--text-muted); }
       .diary-timeline-buttons { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
       .diary-timeline-hint { margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; }
 
-      /* 仅在总开关开启时，才显示可点击/可复制的光标与 hover 效果 */
       .diary-timeline-content.click-enabled .diary-timeline-time { cursor: pointer; }
       .diary-timeline-content.click-enabled .diary-timeline-time:hover { background: var(--background-modifier-hover); text-decoration: underline; }
       .diary-timeline-content.click-enabled .diary-timeline-time:active { background: var(--background-modifier-active-hover); }
@@ -107,6 +125,14 @@ class DiaryLinkTimelinePlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!Array.isArray(this.settings.pinnedFilters)) this.settings.pinnedFilters = [];
+
+    // 迁移：旧版默认值为 LEGACY_DEFAULT_TITLE，新版改为空以支持回退到链接标题
+    if (this.settings.exportTitle === LEGACY_DEFAULT_TITLE && !this.settings._titleMigrated) {
+      this.settings.exportTitle = '';
+      this.settings._titleMigrated = true;
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
@@ -119,18 +145,50 @@ class DiaryLinkTimelinePlugin extends Plugin {
     return path.startsWith(folder + '/');
   }
 
+  isFilterPinned(target) {
+    return (this.settings.pinnedFilters || []).includes(target);
+  }
+
+  async togglePinnedFilter(target) {
+    const list = this.settings.pinnedFilters || [];
+    const idx = list.indexOf(target);
+    if (idx >= 0) list.splice(idx, 1);
+    else list.push(target);
+    this.settings.pinnedFilters = list;
+    await this.saveSettings();
+  }
+
+  async clearPinnedFilters() {
+    this.settings.pinnedFilters = [];
+    await this.saveSettings();
+  }
+
   pad(n) { return n < 10 ? '0' + n : String(n); }
   formatDate(d) { return `${d.getFullYear()}-${this.pad(d.getMonth() + 1)}-${this.pad(d.getDate())}`; }
   formatTime(d) { return `${this.pad(d.getHours())}${this.pad(d.getMinutes())}${this.pad(d.getSeconds())}`; }
   formatTimestamp(d) { return `${this.formatDate(d).replace(/-/g, '')}-${this.formatTime(d)}`; }
   formatDateTime(d) { return `${this.formatDate(d)} ${this.pad(d.getHours())}:${this.pad(d.getMinutes())}:${this.pad(d.getSeconds())}`; }
 
+  /**
+   * 构造模板变量。
+   * {{title}} 回退链：
+   *   1) 用户在设置中填写的非空标题；
+   *   2) 当前筛选目标（即“链接标题”，如“项目A”“无链接”）；
+   *   3) 固定的默认标题。
+   */
   buildTemplateVars(entries, now, extra) {
     now = now || new Date();
     const df = (this.settings.diaryFolder || '').replace(/^\/+|\/+$/g, '');
     const lastSeg = df ? df.split('/').pop() : '';
+    const filterValue = (extra && extra.filter) || '全部';
+
+    let title = (this.settings.exportTitle || '').trim();
+    if (!title) {
+      title = (filterValue && filterValue !== '全部') ? filterValue : LEGACY_DEFAULT_TITLE;
+    }
+
     const vars = {
-      title: this.settings.exportTitle || '日记链接时间轴',
+      title,
       date: this.formatDate(now),
       time: this.formatTime(now),
       datetime: this.formatTimestamp(now),
@@ -139,9 +197,13 @@ class DiaryLinkTimelinePlugin extends Plugin {
       day: this.pad(now.getDate()),
       count: String(entries.length),
       folder: lastSeg,
-      filter: '全部',
+      filter: filterValue,
     };
     if (extra) Object.assign(vars, extra);
+    // 如果 extra 里误传了空 title 会覆盖，这里再做一次兜底
+    if (!String(vars.title || '').trim()) {
+      vars.title = (filterValue && filterValue !== '全部') ? filterValue : LEGACY_DEFAULT_TITLE;
+    }
     return vars;
   }
 
@@ -151,9 +213,14 @@ class DiaryLinkTimelinePlugin extends Plugin {
     });
   }
 
-  buildExportMarkdown(entries) {
+  /**
+   * 导出 Markdown。标题以粗体显示在文件顶部，保持“年=一级标题”的既有结构。
+   */
+  buildExportMarkdown(entries, title) {
     const now = new Date();
+    const t = (title || '').trim() || LEGACY_DEFAULT_TITLE;
     const lines = [
+      '> **' + t + '**',
       '> 导出时间：' + this.formatDateTime(now) + ' · 共 ' + entries.length + ' 条',
       '',
     ];
@@ -217,12 +284,20 @@ class TimelineView extends ItemView {
 
     toolbar.createSpan({ text: '筛选：', cls: 'diary-timeline-status' });
     this.filterEl = toolbar.createEl('select');
-    this.filterEl.onchange = () => this.renderView();
+    this.filterEl.onchange = () => {
+      this.updatePinButton();
+      this.renderView();
+    };
+
+    this.pinCurrentBtn = toolbar.createEl('button', { cls: 'diary-timeline-pin-filter-btn' });
+    this.pinCurrentBtn.onclick = () => this.togglePinCurrentFilter();
 
     const exportBtn = toolbar.createEl('button', { text: '导出…' });
     exportBtn.onclick = () => this.openExportModal();
 
     this.statusEl = toolbar.createSpan({ cls: 'diary-timeline-status' });
+
+    this.pinnedEl = container.createDiv({ cls: 'diary-timeline-pinned-filters is-empty' });
     this.listEl = container.createDiv({ cls: 'diary-timeline-content' });
 
     const onChange = (file) => {
@@ -242,6 +317,7 @@ class TimelineView extends ItemView {
       }
     }));
 
+    this.updatePinButton();
     await this.render(true);
   }
 
@@ -369,8 +445,6 @@ class TimelineView extends ItemView {
     return results;
   }
 
-  // ---------- 筛选相关 ----------
-
   collectLinkTargets(entries) {
     const set = new Set();
     for (const e of entries) {
@@ -385,16 +459,22 @@ class TimelineView extends ItemView {
   }
 
   updateFilterOptions(targets) {
-    const key = targets.join('\u0001');
+    const pinned = this.plugin.settings.pinnedFilters || [];
+    const key = targets.join('\u0001') + '\u0002' + pinned.join('\u0001');
     if (key === this._lastTargetsKey) return;
     this._lastTargetsKey = key;
 
+    const pinnedSet = new Set(pinned);
     const current = this.filterEl.value;
     this.filterEl.empty();
     this.filterEl.createEl('option', { value: '', text: '全部' });
-    this.filterEl.createEl('option', { value: UNLINKED_FILTER, text: '无链接' });
+    this.filterEl.createEl('option', {
+      value: UNLINKED_FILTER,
+      text: (pinnedSet.has(UNLINKED_FILTER) ? '★ ' : '') + '无链接',
+    });
     for (const t of targets) {
-      this.filterEl.createEl('option', { value: t, text: t });
+      const prefix = pinnedSet.has(t) ? '★ ' : '';
+      this.filterEl.createEl('option', { value: t, text: prefix + t });
     }
 
     if (current === UNLINKED_FILTER || (current && targets.includes(current))) {
@@ -402,6 +482,7 @@ class TimelineView extends ItemView {
     } else {
       this.filterEl.value = '';
     }
+    this.updatePinButton();
   }
 
   entryHasLink(entry) {
@@ -425,7 +506,111 @@ class TimelineView extends ItemView {
     return entries.filter((e) => this.entryHasTarget(e, f));
   }
 
-  // ---------- 交互：跳转 / 筛选 / 复制 ----------
+  updatePinButton() {
+    if (!this.pinCurrentBtn) return;
+    const target = this.filterEl.value;
+    const canPin = !!target;
+    const pinned = canPin && this.plugin.isFilterPinned(target);
+    this.pinCurrentBtn.textContent = pinned ? '★' : '☆';
+    this.pinCurrentBtn.title = !canPin
+      ? '当前为“全部”，无需置顶'
+      : (pinned ? '取消置顶当前筛选' : '置顶当前筛选');
+    this.pinCurrentBtn.disabled = !canPin;
+    this.pinCurrentBtn.classList.toggle('is-pinned', pinned);
+  }
+
+  async togglePinCurrentFilter() {
+    const target = this.filterEl.value;
+    if (!target) {
+      new Notice('“全部”是默认视图，无需置顶');
+      return;
+    }
+    await this.plugin.togglePinnedFilter(target);
+    this.updatePinButton();
+    this.renderPinnedFilters();
+    this._lastTargetsKey = null;
+    this.updateFilterOptions(this.collectLinkTargets(this.lastEntries));
+  }
+
+  renderPinnedFilters() {
+    if (!this.pinnedEl) return;
+    this.pinnedEl.empty();
+
+    const pinned = this.plugin.settings.pinnedFilters || [];
+    if (!pinned.length) {
+      this.pinnedEl.addClass('is-empty');
+      return;
+    }
+    this.pinnedEl.removeClass('is-empty');
+
+    this.pinnedEl.createSpan({ cls: 'diary-timeline-pinned-label', text: '📌 置顶筛选' });
+
+    const available = new Set(this.collectLinkTargets(this.lastEntries));
+    available.add(UNLINKED_FILTER);
+
+    const current = this.filterEl.value;
+
+    for (const target of pinned) {
+      const label = this.filterLabel(target);
+      const isValid = available.has(target);
+      const chip = this.pinnedEl.createDiv({ cls: 'diary-timeline-chip' });
+      if (target === current) chip.addClass('is-active');
+      if (!isValid) chip.addClass('is-invalid');
+
+      const labelEl = chip.createSpan({ cls: 'diary-timeline-chip-label', text: label });
+      labelEl.title = (isValid
+        ? '单击切换到此筛选 · 右键或长按可取消置顶'
+        : '当前数据中无匹配结果 · 右键或长按可取消置顶');
+
+      const unpin = async () => {
+        await this.plugin.togglePinnedFilter(target);
+        this.updatePinButton();
+        this.renderPinnedFilters();
+        this._lastTargetsKey = null;
+        this.updateFilterOptions(this.collectLinkTargets(this.lastEntries));
+        new Notice('已取消置顶：' + label);
+      };
+
+      let pressTimer = null;
+      let longPressed = false;
+
+      labelEl.addEventListener('pointerdown', (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        longPressed = false;
+        if (pressTimer) clearTimeout(pressTimer);
+        pressTimer = setTimeout(async () => {
+          longPressed = true;
+          pressTimer = null;
+          await unpin();
+        }, 600);
+      });
+
+      const cancelTimer = () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      };
+      labelEl.addEventListener('pointerup', cancelTimer);
+      labelEl.addEventListener('pointercancel', cancelTimer);
+      labelEl.addEventListener('pointerleave', cancelTimer);
+
+      labelEl.addEventListener('click', () => {
+        if (longPressed) { longPressed = false; return; }
+        if (!isValid) {
+          new Notice('当前数据中没有 "' + label + '" 的匹配结果');
+          return;
+        }
+        this.filterEl.value = target;
+        this.updatePinButton();
+        this.renderView();
+      });
+
+      labelEl.addEventListener('contextmenu', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (longPressed) { longPressed = false; return; }
+        await unpin();
+      });
+    }
+  }
 
   async openFileInWorkspace(file) {
     let targetLeaf = null;
@@ -505,7 +690,6 @@ class TimelineView extends ItemView {
     }
   }
 
-  // 点击双链时按目标值筛选
   applyFilterForLink(rawTarget) {
     const normalize = (s) => String(s || '')
       .replace(/\.md$/, '')
@@ -518,14 +702,15 @@ class TimelineView extends ItemView {
     const opts = Array.from(this.filterEl.options).map((o) => o.value);
     if (opts.includes(target)) {
       this.filterEl.value = target;
+      this.updatePinButton();
       this.renderView();
       return true;
     }
-    // 路径不一致时，用 basename 兜底
     const base = target.split('/').pop();
     const found = opts.find((v) => v && v.split('/').pop() === base);
     if (found) {
       this.filterEl.value = found;
+      this.updatePinButton();
       this.renderView();
       return true;
     }
@@ -575,14 +760,13 @@ class TimelineView extends ItemView {
       }
     };
 
-    // 1) 双链点击：仅当总开关开启且 linkClickAction === 'filter' 时拦截
     textEl.addEventListener('click', (e) => {
-      if (!enabled()) return; // 关闭时完全让原生行为接管
+      if (!enabled()) return;
       const linkEl = e.target.closest('a');
       if (!linkEl) return;
       const isInternal = linkEl.classList.contains('internal-link') || linkEl.hasAttribute('data-href');
-      if (!isInternal) return; // 外部链接也交给原生
-      if ((s().linkClickAction || 'navigate') !== 'filter') return; // navigate 时交给原生
+      if (!isInternal) return;
+      if ((s().linkClickAction || 'navigate') !== 'filter') return;
 
       e.preventDefault();
       e.stopPropagation();
@@ -596,7 +780,6 @@ class TimelineView extends ItemView {
       }
     }, true);
 
-    // 2) 文字短按/长按复制：受总开关 + 文字复制开关双重控制
     textEl.addEventListener('pointerdown', (e) => {
       if (!copyEnabled()) return;
       if (isLinkEl(e.target)) return;
@@ -643,8 +826,6 @@ class TimelineView extends ItemView {
     });
   }
 
-  // ---------- 渲染 ----------
-
   async render(force) {
     if (this._rendering) { this._pendingRefresh = true; return; }
     this._rendering = true;
@@ -670,10 +851,11 @@ class TimelineView extends ItemView {
   }
 
   async renderView(t0) {
-    // 根据总开关更新光标/hover 状态
     if (this.listEl) {
       this.listEl.toggleClass('click-enabled', !!this.plugin.settings.enableClickActions);
     }
+
+    this.renderPinnedFilters();
 
     const entries = this.applyFilter(this.lastEntries);
     this.filteredEntries = entries;
@@ -868,7 +1050,8 @@ class ExportModal extends Modal {
     }
     try {
       this.persistSettings();
-      const md = this.plugin.buildExportMarkdown(this.entries);
+      // 关键修复：把 vars.title 传给 buildExportMarkdown
+      const md = this.plugin.buildExportMarkdown(this.entries, vars.title);
       const file = await this.app.vault.create(path, md);
       await this.app.workspace.getLeaf(true).openFile(file);
       new Notice('已导出：' + path);
@@ -885,7 +1068,8 @@ class ExportModal extends Modal {
     const fileName = this.resolveName(vars);
     try {
       this.persistSettings();
-      const md = this.plugin.buildExportMarkdown(this.entries);
+      // 关键修复：把 vars.title 传给 buildExportMarkdown
+      const md = this.plugin.buildExportMarkdown(this.entries, vars.title);
       const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -916,12 +1100,14 @@ class TimelineSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  // 设置变化后刷新所有时间轴视图（只重绘，不重扫）
   refreshAllViews() {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of leaves) {
       if (leaf.view instanceof TimelineView) {
-        leaf.view.renderView();
+        leaf.view._lastTargetsKey = null;
+        leaf.view.updateFilterOptions(leaf.view.collectLinkTargets(leaf.view.lastEntries));
+        leaf.view.updatePinButton();
+        leaf.view.renderPinnedFilters();
       }
     }
   }
@@ -930,7 +1116,6 @@ class TimelineSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // ---- 数据源 ----
     new Setting(containerEl)
       .setName('日记文件夹路径')
       .setDesc('只扫描该文件夹内的 Markdown 文件（含子文件夹）。留空表示整个库。')
@@ -949,7 +1134,6 @@ class TimelineSettingTab extends PluginSettingTab {
           }
         }));
 
-    // ---- 点击交互 ----
     containerEl.createEl('h4', { text: '点击交互' });
 
     new Setting(containerEl)
@@ -960,7 +1144,10 @@ class TimelineSettingTab extends PluginSettingTab {
         .onChange(async (v) => {
           this.plugin.settings.enableClickActions = v;
           await this.plugin.saveSettings();
-          this.refreshAllViews();
+          const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+          for (const leaf of leaves) {
+            if (leaf.view instanceof TimelineView) leaf.view.renderView();
+          }
         }));
 
     new Setting(containerEl)
@@ -985,7 +1172,43 @@ class TimelineSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    // ---- 导出 ----
+    containerEl.createEl('h4', { text: '置顶筛选' });
+
+    const pinned = this.plugin.settings.pinnedFilters || [];
+    if (pinned.length === 0) {
+      containerEl.createEl('p', {
+        cls: 'setting-item-description',
+        text: '（无）在视图工具栏选择筛选目标后，点击 ☆ 可置顶。视图顶部会显示快捷 chip，单击 chip 切换筛选，右键或长按 chip 取消置顶。',
+      });
+    } else {
+      containerEl.createEl('p', {
+        cls: 'setting-item-description',
+        text: '以下是已置顶的筛选目标。视图顶部单击 chip 切换筛选，右键或长按 chip 也可取消置顶；也可以在下方逐个移除。',
+      });
+      for (const target of pinned) {
+        const label = target === UNLINKED_FILTER ? '无链接' : target;
+        new Setting(containerEl)
+          .setName(label)
+          .addButton((b) => b
+            .setButtonText('取消置顶')
+            .onClick(async () => {
+              await this.plugin.togglePinnedFilter(target);
+              this.refreshAllViews();
+              this.display();
+            }));
+      }
+      new Setting(containerEl)
+        .addButton((b) => b
+          .setButtonText('清除全部置顶')
+          .setWarning()
+          .onClick(async () => {
+            if (!window.confirm('确定要清除所有置顶筛选吗？')) return;
+            await this.plugin.clearPinnedFilters();
+            this.refreshAllViews();
+            this.display();
+          }));
+    }
+
     containerEl.createEl('h4', { text: '导出' });
 
     new Setting(containerEl)
@@ -1012,9 +1235,9 @@ class TimelineSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('导出标题（{{title}}）')
-      .setDesc('替换模板中的 {{title}}。')
+      .setDesc('留空时：有筛选目标则用该目标（链接标题），否则用“日记链接时间轴”。此标题会出现在导出文件的顶部，也会替换文件名模板中的 {{title}}。')
       .addText((t) => t
-        .setPlaceholder('日记链接时间轴')
+        .setPlaceholder('留空则使用筛选目标或默认标题')
         .setValue(this.plugin.settings.exportTitle || '')
         .onChange(async (v) => {
           this.plugin.settings.exportTitle = v.trim();
