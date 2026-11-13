@@ -13,7 +13,33 @@ const DEFAULT_SETTINGS = {
   exportFolder: '',
   exportNameTemplate: '{{title}}-{{datetime}}',
   exportTitle: '日记链接时间轴',
+  enableClickActions: true, // 总开关
+  linkClickAction: 'navigate', // 'navigate' | 'filter'
+  textClickCopy: true,
 };
+
+async function writeClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
 
 class DiaryLinkTimelinePlugin extends Plugin {
   async onload() {
@@ -30,15 +56,25 @@ class DiaryLinkTimelinePlugin extends Plugin {
       .diary-timeline-content h1 { margin-top: 32px; border-bottom: 2px solid var(--text-accent); padding-bottom: 6px; font-size: 1.5em; }
       .diary-timeline-content h2 { margin-top: 24px; border-bottom: 2px solid var(--background-modifier-border); padding-bottom: 4px; }
       .diary-timeline-content h3 { margin-top: 16px; color: var(--text-accent); }
+      .diary-timeline-content h3.diary-timeline-date { display: inline-block; }
       .diary-timeline-entry { display: flex; gap: 8px; margin: 8px 0; padding: 8px; border-left: 3px solid var(--interactive-accent); background: var(--background-secondary); border-radius: 4px; }
       .diary-timeline-entry.is-unlinked { border-left-color: var(--background-modifier-border); opacity: 0.85; }
-      .diary-timeline-time { font-weight: 600; color: var(--text-accent); white-space: nowrap; font-variant-numeric: tabular-nums; }
-      .diary-timeline-text { flex: 1; min-width: 0; }
+      .diary-timeline-time { font-weight: 600; color: var(--text-accent); white-space: nowrap; font-variant-numeric: tabular-nums; padding: 0 4px; border-radius: 3px; transition: background 0.15s; user-select: none; }
+      .diary-timeline-text { flex: 1; min-width: 0; border-radius: 3px; transition: background 0.15s; }
+      .diary-timeline-text.is-copied { background: var(--text-selection); transition: background 0.3s; }
       .diary-timeline-text p:first-child { margin-top: 0; }
       .diary-timeline-text p:last-child { margin-bottom: 0; }
       .diary-timeline-preview { margin: 12px 0; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-family: var(--font-monospace); font-size: 0.9em; word-break: break-all; color: var(--text-muted); }
       .diary-timeline-buttons { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
       .diary-timeline-hint { margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; }
+
+      /* 仅在总开关开启时，才显示可点击/可复制的光标与 hover 效果 */
+      .diary-timeline-content.click-enabled .diary-timeline-time { cursor: pointer; }
+      .diary-timeline-content.click-enabled .diary-timeline-time:hover { background: var(--background-modifier-hover); text-decoration: underline; }
+      .diary-timeline-content.click-enabled .diary-timeline-time:active { background: var(--background-modifier-active-hover); }
+      .diary-timeline-content.click-enabled .diary-timeline-date { cursor: pointer; }
+      .diary-timeline-content.click-enabled .diary-timeline-date:hover { text-decoration: underline; }
+      .diary-timeline-content.click-enabled .diary-timeline-text { cursor: copy; }
     `;
     document.head.appendChild(style);
     this.register(() => style.remove());
@@ -253,11 +289,12 @@ class TimelineView extends ItemView {
     const isHeading = (line) => /^#{1,6}(?:\s|$)/.test(line);
     const isDivider = (line) => /^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line);
 
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       const m = line.match(/^\s*-\s*(\d{2}:\d{2}:\d{2})(.*)$/);
       if (m) {
         if (current) blocks.push(current);
-        current = { time: m[1], text: (m[2] || '').replace(/^\s+/, '') };
+        current = { time: m[1], text: (m[2] || '').replace(/^\s+/, ''), line: i };
         continue;
       }
       if (current) {
@@ -275,7 +312,7 @@ class TimelineView extends ItemView {
     for (const b of blocks) {
       const text = b.text.trim();
       if (!text) continue;
-      out.push({ date, month: date.slice(0, 7), time: b.time, text, sourcePath });
+      out.push({ date, month: date.slice(0, 7), time: b.time, text, sourcePath, line: b.line });
     }
     return out;
   }
@@ -383,9 +420,227 @@ class TimelineView extends ItemView {
 
   applyFilter(entries) {
     const f = this.filterEl.value;
-    if (!f) return entries; // 全部
+    if (!f) return entries;
     if (f === UNLINKED_FILTER) return entries.filter((e) => !this.entryHasLink(e));
     return entries.filter((e) => this.entryHasTarget(e, f));
+  }
+
+  // ---------- 交互：跳转 / 筛选 / 复制 ----------
+
+  async openFileInWorkspace(file) {
+    let targetLeaf = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (!targetLeaf && leaf.view && leaf.view.file && leaf.view.file.path === file.path) {
+        targetLeaf = leaf;
+      }
+    });
+    if (!targetLeaf) {
+      const activeLeaf = this.app.workspace.activeLeaf;
+      if (activeLeaf && activeLeaf.view && typeof activeLeaf.view.getViewType === 'function'
+        && activeLeaf.view.getViewType() === 'markdown') {
+        targetLeaf = activeLeaf;
+      }
+    }
+    if (!targetLeaf) targetLeaf = this.app.workspace.getLeaf('tab');
+    await targetLeaf.openFile(file);
+    try { this.app.workspace.setActiveLeaf(targetLeaf, { focus: true }); } catch (e) { /* ignore */ }
+    return targetLeaf;
+  }
+
+  async jumpToSource(entry) {
+    const file = this.app.vault.getAbstractFileByPath(entry.sourcePath);
+    if (!file) {
+      new Notice('找不到源文件：' + entry.sourcePath);
+      return;
+    }
+    try {
+      const targetLeaf = await this.openFileInWorkspace(file);
+      const view = targetLeaf.view;
+      const editor = view && view.editor;
+      if (editor) {
+        const pos = { line: entry.line, ch: 0 };
+        editor.setCursor(pos);
+        editor.scrollIntoView({ from: pos, to: pos }, true);
+        editor.focus();
+      }
+    } catch (err) {
+      console.error('[diary-link-timeline] jump failed', err);
+      new Notice('跳转失败：' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  findDiaryForDate(dateStr) {
+    const folder = (this.plugin.settings.diaryFolder || '').replace(/^\/+|\/+$/g, '');
+    const files = this.app.vault.getMarkdownFiles().filter((f) => {
+      if (f.name.startsWith(EXPORT_PREFIX)) return false;
+      if (!folder) return true;
+      return f.path.startsWith(folder + '/');
+    });
+
+    for (const f of files) {
+      if (f.basename.includes(dateStr)) return f;
+    }
+    for (const f of files) {
+      const cache = this.app.metadataCache.getFileCache(f);
+      if (!cache || !cache.frontmatter) continue;
+      const raw = cache.frontmatter.date || cache.frontmatter.created || cache.frontmatter.day;
+      if (!raw) continue;
+      const s = raw instanceof Date ? raw.toISOString().slice(0, 10) : String(raw).slice(0, 10);
+      if (s === dateStr) return f;
+    }
+    return null;
+  }
+
+  async jumpToDiary(dateStr) {
+    const file = this.findDiaryForDate(dateStr);
+    if (!file) {
+      new Notice('未找到 ' + dateStr + ' 的日记文件');
+      return;
+    }
+    try {
+      await this.openFileInWorkspace(file);
+    } catch (err) {
+      console.error('[diary-link-timeline] open diary failed', err);
+      new Notice('打开日记失败：' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  // 点击双链时按目标值筛选
+  applyFilterForLink(rawTarget) {
+    const normalize = (s) => String(s || '')
+      .replace(/\.md$/, '')
+      .replace(/^\.\//, '')
+      .split('#')[0]
+      .trim();
+    const target = normalize(rawTarget);
+    if (!target) return false;
+
+    const opts = Array.from(this.filterEl.options).map((o) => o.value);
+    if (opts.includes(target)) {
+      this.filterEl.value = target;
+      this.renderView();
+      return true;
+    }
+    // 路径不一致时，用 basename 兜底
+    const base = target.split('/').pop();
+    const found = opts.find((v) => v && v.split('/').pop() === base);
+    if (found) {
+      this.filterEl.value = found;
+      this.renderView();
+      return true;
+    }
+    return false;
+  }
+
+  bindTimeClick(timeEl, entry) {
+    timeEl.title = '点击跳转到原文位置';
+    timeEl.addEventListener('click', (e) => {
+      if (!this.plugin.settings.enableClickActions) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.jumpToSource(entry);
+    });
+  }
+
+  bindDateClick(h3, dateStr) {
+    h3.title = '点击打开该日期的日记';
+    h3.addEventListener('click', (e) => {
+      if (!this.plugin.settings.enableClickActions) return;
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) return;
+      e.preventDefault();
+      this.jumpToDiary(dateStr);
+    });
+  }
+
+  bindTextCopy(textEl, entry) {
+    const s = () => this.plugin.settings;
+    const enabled = () => !!s().enableClickActions;
+    const copyEnabled = () => enabled() && !!s().textClickCopy;
+
+    let pressTimer = null;
+    let pressStart = 0;
+    let moved = false;
+    let justCopied = false;
+    const isLinkEl = (el) => !!(el && el.closest && el.closest('a'));
+
+    const doCopy = async () => {
+      const ok = await writeClipboard(entry.text);
+      if (ok) {
+        new Notice('已复制');
+        textEl.classList.add('is-copied');
+        setTimeout(() => textEl.classList.remove('is-copied'), 300);
+      } else {
+        new Notice('复制失败');
+      }
+    };
+
+    // 1) 双链点击：仅当总开关开启且 linkClickAction === 'filter' 时拦截
+    textEl.addEventListener('click', (e) => {
+      if (!enabled()) return; // 关闭时完全让原生行为接管
+      const linkEl = e.target.closest('a');
+      if (!linkEl) return;
+      const isInternal = linkEl.classList.contains('internal-link') || linkEl.hasAttribute('data-href');
+      if (!isInternal) return; // 外部链接也交给原生
+      if ((s().linkClickAction || 'navigate') !== 'filter') return; // navigate 时交给原生
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
+      let raw = linkEl.getAttribute('data-href') || linkEl.getAttribute('href') || '';
+      try { raw = decodeURIComponent(raw); } catch (err) { /* ignore */ }
+
+      if (!this.applyFilterForLink(raw)) {
+        new Notice('筛选列表中未找到该链接目标：' + raw);
+      }
+    }, true);
+
+    // 2) 文字短按/长按复制：受总开关 + 文字复制开关双重控制
+    textEl.addEventListener('pointerdown', (e) => {
+      if (!copyEnabled()) return;
+      if (isLinkEl(e.target)) return;
+      pressStart = Date.now();
+      moved = false;
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = setTimeout(() => {
+        if (!moved) {
+          doCopy();
+          justCopied = true;
+        }
+        pressTimer = null;
+      }, 600);
+    });
+
+    textEl.addEventListener('pointermove', () => { moved = true; });
+
+    textEl.addEventListener('pointerup', (e) => {
+      if (!copyEnabled()) { moved = true; return; }
+      if (isLinkEl(e.target)) { moved = true; return; }
+      const elapsed = Date.now() - pressStart;
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+        if (!moved && elapsed < 600) {
+          const sel = window.getSelection();
+          if (!sel || sel.isCollapsed) {
+            doCopy();
+          }
+        }
+      }
+    });
+
+    textEl.addEventListener('pointercancel', () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      moved = true;
+    });
+
+    textEl.addEventListener('contextmenu', (e) => {
+      if (justCopied) {
+        e.preventDefault();
+        justCopied = false;
+      }
+    });
   }
 
   // ---------- 渲染 ----------
@@ -415,6 +670,11 @@ class TimelineView extends ItemView {
   }
 
   async renderView(t0) {
+    // 根据总开关更新光标/hover 状态
+    if (this.listEl) {
+      this.listEl.toggleClass('click-enabled', !!this.plugin.settings.enableClickActions);
+    }
+
     const entries = this.applyFilter(this.lastEntries);
     this.filteredEntries = entries;
 
@@ -451,20 +711,27 @@ class TimelineView extends ItemView {
       }
       if (e.date !== lastDate) {
         const h3 = document.createElement('h3');
+        h3.className = 'diary-timeline-date';
         h3.textContent = e.date;
+        this.bindDateClick(h3, e.date);
         frag.appendChild(h3);
         lastDate = e.date;
       }
       const row = document.createElement('div');
       row.className = 'diary-timeline-entry';
       if (!this.entryHasLink(e)) row.classList.add('is-unlinked');
+
       const timeEl = document.createElement('span');
       timeEl.className = 'diary-timeline-time';
       timeEl.textContent = e.time;
+      this.bindTimeClick(timeEl, e);
       row.appendChild(timeEl);
+
       const textEl = document.createElement('div');
       textEl.className = 'diary-timeline-text';
+      this.bindTextCopy(textEl, e);
       row.appendChild(textEl);
+
       frag.appendChild(row);
       tasks.push(this.renderMarkdown(e.text, textEl, e.sourcePath));
     }
@@ -649,10 +916,21 @@ class TimelineSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  // 设置变化后刷新所有时间轴视图（只重绘，不重扫）
+  refreshAllViews() {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+    for (const leaf of leaves) {
+      if (leaf.view instanceof TimelineView) {
+        leaf.view.renderView();
+      }
+    }
+  }
+
   display() {
     const { containerEl } = this;
     containerEl.empty();
 
+    // ---- 数据源 ----
     new Setting(containerEl)
       .setName('日记文件夹路径')
       .setDesc('只扫描该文件夹内的 Markdown 文件（含子文件夹）。留空表示整个库。')
@@ -670,6 +948,45 @@ class TimelineSettingTab extends PluginSettingTab {
             }
           }
         }));
+
+    // ---- 点击交互 ----
+    containerEl.createEl('h4', { text: '点击交互' });
+
+    new Setting(containerEl)
+      .setName('启用点击交互')
+      .setDesc('总开关。关闭后时间、日期、双链、文字的所有点击增强都失效，视图变为纯展示。')
+      .addToggle((t) => t
+        .setValue(!!this.plugin.settings.enableClickActions)
+        .onChange(async (v) => {
+          this.plugin.settings.enableClickActions = v;
+          await this.plugin.saveSettings();
+          this.refreshAllViews();
+        }));
+
+    new Setting(containerEl)
+      .setName('点击 [[双链]] 时')
+      .setDesc('“跳转到链接目标”：使用 Obsidian 原生跳转；“按该目标筛选”：把工具栏筛选切到该目标并刷新视图。')
+      .addDropdown((d) => d
+        .addOption('navigate', '跳转到链接目标')
+        .addOption('filter', '按该目标筛选')
+        .setValue(this.plugin.settings.linkClickAction || 'navigate')
+        .onChange(async (v) => {
+          this.plugin.settings.linkClickAction = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('点击文字时复制时间块')
+      .setDesc('开启后，短按（未选中文字）或长按 600ms 会复制该时间块的原始 Markdown。')
+      .addToggle((t) => t
+        .setValue(!!this.plugin.settings.textClickCopy)
+        .onChange(async (v) => {
+          this.plugin.settings.textClickCopy = v;
+          await this.plugin.saveSettings();
+        }));
+
+    // ---- 导出 ----
+    containerEl.createEl('h4', { text: '导出' });
 
     new Setting(containerEl)
       .setName('导出文件夹')
