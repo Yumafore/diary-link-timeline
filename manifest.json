@@ -1,0 +1,9 @@
+{
+  "id": "diary-link-timeline",
+  "name": "Diary Link Timeline",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "A timeline view for diary entries.",
+  "author": "Your Name",
+  "isDesktopOnly": false
+}
